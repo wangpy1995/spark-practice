@@ -13,8 +13,9 @@ import org.apache.hadoop.util.StopWatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
+import java.io.*;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -23,39 +24,67 @@ import java.util.concurrent.TimeUnit;
  * 先等分,再找\n分隔符
  */
 public class FixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
+    public static final String ENCODING = "mapreduce.input.fileinputformat.encoding";
+
     private static final Logger LOG = LoggerFactory.getLogger(FixedLineFileFormat.class);
 
     @Override
     public RecordReader<LongWritable, Text> createRecordReader(InputSplit inputSplit, TaskAttemptContext taskAttemptContext) throws IOException, InterruptedException {
         if (inputSplit instanceof FileSplit) {
             RecordReader<LongWritable, Text> recordReader = new RecordReader<LongWritable, Text>() {
-                private long start = 0;
                 private long count = 0;
                 private int length = 0;
                 private Text value;
-                FSDataInputStream inputStream;
+                private long cursor = 0;
+                FSDataInputStream fsDataInputStream;
+                private String encoding;
+                private final ByteArrayOutputStream byteBuffer = new ByteArrayOutputStream(128);
 
                 @Override
                 public void initialize(InputSplit inputSplit, TaskAttemptContext taskAttemptContext) throws IOException, InterruptedException {
                     if (inputSplit instanceof FileSplit fileSplit) {
-                        start = fileSplit.getStart();
-                        inputStream = fileSplit.getPath().getFileSystem(taskAttemptContext.getConfiguration()).open(fileSplit.getPath());
-                        inputStream.seek(start);
+                        long start = fileSplit.getStart();
+                        fsDataInputStream = fileSplit.getPath().getFileSystem(taskAttemptContext.getConfiguration()).open(fileSplit.getPath());
+                        fsDataInputStream.seek(start);
                         length = (int) fileSplit.getLength();
+                        encoding = taskAttemptContext.getConfiguration().get(ENCODING, "UTF-8");
                     }
                 }
 
                 @Override
                 public boolean nextKeyValue() throws IOException, InterruptedException {
-                    if (length == 0) {
+                    if (length == 0 || cursor >= length) {
                         value = null;
                         return false;
                     }
-                    byte[] buf = new byte[length];
-                    inputStream.read(buf);
-                    value = new Text(buf);
+                    boolean curLine = true;
+                    int index = 0;
+                    int ch;
+                    while (curLine && (index + cursor) < length) {
+                        ch = fsDataInputStream.read();
+                        switch (ch) {
+                            case -1, '\n':
+                                curLine = false;
+                                break;
+                            case '\r':
+                                int c = fsDataInputStream.read();
+                                if (c == '\n') {
+                                    // 兼容windows, 将\r\n视为一个符号,只移动cursor不存储内容
+                                    cursor++;
+                                    curLine = false;
+                                } else {
+                                    byteBuffer.write(c);
+                                }
+                                break;
+                            default:
+                                byteBuffer.write(ch);
+                        }
+                        index++;
+                    }
+                    cursor += index;
+                    value = new Text(byteBuffer.toString(encoding));
                     count++;
-                    length = 0;
+                    byteBuffer.reset();
                     return true;
                 }
 
@@ -71,12 +100,12 @@ public class FixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
 
                 @Override
                 public float getProgress() throws IOException, InterruptedException {
-                    return 0;
+                    return (float) cursor / length;
                 }
 
                 @Override
                 public void close() throws IOException {
-                    inputStream.close();
+                    fsDataInputStream.close();
                 }
             };
             recordReader.initialize(inputSplit, taskAttemptContext);
@@ -117,7 +146,7 @@ public class FixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
                         long pos = 0;
                         long lastPos = pos;
                         for (int i = 1; i < numSplits; i++) {
-                            pos += splitSize * i;
+                            pos += splitSize;
                             if (pos < length) {
                                 raf.seek(pos);
                                 // 找到下一个行边界
