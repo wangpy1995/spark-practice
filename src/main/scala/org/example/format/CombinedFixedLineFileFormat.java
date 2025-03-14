@@ -8,6 +8,7 @@ import org.apache.hadoop.mapreduce.JobContext;
 import org.apache.hadoop.mapreduce.RecordReader;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
+import org.apache.hadoop.mapreduce.lib.input.FileSplit;
 import org.apache.hadoop.util.StopWatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,17 +19,30 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 /**
- * 单个大文本文件
- * 先等分,再找\n分隔符标记分割位置
+ * 多个文本文件, 标记\n并行读取
+ * 小文件划分进同一个split, 大文件拆分为多个split
  */
-public class FixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
-    public static final String ENCODING = "mapreduce.input.fileinputformat.encoding";
-
-    private static final Logger LOG = LoggerFactory.getLogger(FixedLineFileFormat.class);
+public class CombinedFixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
+    private static final Logger LOG = LoggerFactory.getLogger(CombinedFixedLineFileFormat.class);
+    private long combinedSplitSize = 0;
 
     @Override
-    public RecordReader<LongWritable, Text> createRecordReader(InputSplit inputSplit, TaskAttemptContext taskAttemptContext) throws IOException, InterruptedException {
-        return new FixedLineRecordReader();
+    public RecordReader<LongWritable, Text> createRecordReader(InputSplit combinedFileSplit, TaskAttemptContext taskAttemptContext) throws IOException, InterruptedException {
+        return new CombinedFixedLineRecordReader();
+    }
+
+    private CombinedFileSplit addSplitToCombined(CombinedFileSplit combinedSplit, List<InputSplit> splits, FileSplit fileSplit, long maxSize) {
+        // 不大于预期大小30% ,也直接加入到combinedSplit中
+        if (combinedSplit.getLength() <= 0.3 * maxSize || combinedSplit.getLength() + fileSplit.getLength() <= maxSize) {
+            combinedSplit.addSplit(fileSplit);
+            LOG.info("Adding to combined: {} {} {}", fileSplit.getStart(), fileSplit.getLength(), fileSplit.getStart() + fileSplit.getLength() + 1);
+        } else {
+            LOG.info("Combined split: {} {}", combinedSplit.getStart(), combinedSplit.getLength());
+            splits.add(combinedSplit);
+            combinedSplit = new CombinedFileSplit();
+            combinedSplit.addSplit(fileSplit);
+        }
+        return combinedSplit;
     }
 
     @Override
@@ -40,10 +54,14 @@ public class FixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
         List<FileStatus> files = this.listStatus(job);
         boolean ignoreDirs = !getInputDirRecursive(job) && job.getConfiguration().getBoolean("mapreduce.input.fileinputformat.input.dir.nonrecursive.ignore.subdirs", false);
 
+        CombinedFileSplit combinedSplit = new CombinedFileSplit();
+        long totalLength = 0L;
         for (FileStatus file : files) {
+            FileSplit fileSplit;
             if (!ignoreDirs || !file.isDirectory()) {
                 Path path = file.getPath();
                 long length = file.getLen();
+                totalLength += length;
                 if (length != 0L) {
                     BlockLocation[] blkLocations;
                     if (file instanceof LocatedFileStatus) {
@@ -70,34 +88,39 @@ public class FixedLineFileFormat extends FileInputFormat<LongWritable, Text> {
                                     pos++;
                                     raf.seek(pos);
                                 }
-
                                 int blkIndex = this.getBlockIndex(blkLocations, lastPos);
-                                splits.add(this.makeSplit(path, lastPos, pos - lastPos, blkLocations[blkIndex].getHosts(), blkLocations[blkIndex].getCachedHosts()));
-                                LOG.info("Adding split: {} {} {}", lastPos, pos - lastPos, pos + 1);
+                                fileSplit = this.makeSplit(path, lastPos, pos - lastPos, blkLocations[blkIndex].getHosts(), blkLocations[blkIndex].getCachedHosts());
+                                combinedSplit = addSplitToCombined(combinedSplit, splits, fileSplit, maxSize);
                                 lastPos = pos + 1;
                             } else {
                                 break;
                             }
                         }
-
+                        // 收尾
                         if (lastPos < length) {
                             int blkIndex = this.getBlockIndex(blkLocations, lastPos);
-                            splits.add(this.makeSplit(path, lastPos, length - lastPos, blkLocations[blkIndex].getHosts(), blkLocations[blkIndex].getCachedHosts()));
-                            LOG.info("Adding last split: {} {} {}", lastPos, length - lastPos, length);
+                            fileSplit = this.makeSplit(path, lastPos, length - lastPos, blkLocations[blkIndex].getHosts(), blkLocations[blkIndex].getCachedHosts());
+                            combinedSplit = addSplitToCombined(combinedSplit, splits, fileSplit, maxSize);
+                            LOG.info("{}: last split.", fileSplit.getPath().getName());
                         }
                         raf.close();
                     } else {
+                        // 文件无法切分
                         if (LOG.isDebugEnabled() && length > Math.min(file.getBlockSize(), minSize)) {
                             LOG.debug("File is not splittable so no parallelization is possible: {}", file.getPath());
                         }
-
-                        splits.add(this.makeSplit(path, 0L, length, blkLocations[0].getHosts(), blkLocations[0].getCachedHosts()));
+                        fileSplit = this.makeSplit(path, 0L, length, blkLocations[0].getHosts());
+                        combinedSplit = addSplitToCombined(combinedSplit, splits, fileSplit, maxSize);
                     }
                 } else {
-                    splits.add(this.makeSplit(path, 0L, length, new String[0]));
+                    // 长度为0
+                    fileSplit = this.makeSplit(path, 0L, length, new String[0]);
+                    combinedSplit = addSplitToCombined(combinedSplit, splits, fileSplit, maxSize);
                 }
             }
         }
+        LOG.info("Combined split: {} {}", combinedSplit.getStart(), combinedSplit.getLength());
+        splits.add(combinedSplit);
 
         job.getConfiguration().setLong("mapreduce.input.fileinputformat.numinputfiles", (long) files.size());
         sw.stop();
